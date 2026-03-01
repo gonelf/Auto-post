@@ -1,28 +1,26 @@
-import { getDbClient, DatabaseError } from './client';
+import { getDbClient, dbCall, isNotFound } from './client';
 import type { UserRow } from './types';
 
 export async function getUserById(id: string): Promise<UserRow | null> {
   const db = getDbClient();
-  const { data, error } = await db.from('users').select('*').eq('id', id).single();
-  if (error) {
-    if (error.code === 'PGRST116') return null; // not found
-    throw new DatabaseError(error.message);
+  try {
+    return await dbCall(() => db.collection<UserRow>('users').getOne(id));
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
   }
-  return data as UserRow;
 }
 
 export async function getUserByRedditId(redditUserId: string): Promise<UserRow | null> {
   const db = getDbClient();
-  const { data, error } = await db
-    .from('users')
-    .select('*')
-    .eq('reddit_user_id', redditUserId)
-    .single();
-  if (error) {
-    if (error.code === 'PGRST116') return null;
-    throw new DatabaseError(error.message);
+  try {
+    return await dbCall(() =>
+      db.collection<UserRow>('users').getFirstListItem(`reddit_user_id = "${redditUserId}"`)
+    );
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
   }
-  return data as UserRow;
 }
 
 export interface UpsertUserParams {
@@ -34,21 +32,21 @@ export interface UpsertUserParams {
   avatar_url?: string | null;
 }
 
+/** Create or update a user record matched by reddit_user_id. */
 export async function upsertUser(params: UpsertUserParams): Promise<UserRow> {
   const db = getDbClient();
-  const { data, error } = await db
-    .from('users')
-    .upsert(
-      {
-        ...params,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'reddit_user_id' }
-    )
-    .select()
-    .single();
-  if (error) throw new DatabaseError(error.message);
-  return data as UserRow;
+
+  const existing = await getUserByRedditId(params.reddit_user_id);
+
+  if (existing) {
+    return dbCall(() =>
+      db.collection<UserRow>("users").update(existing.id, { ...params })
+    );
+  }
+
+  return dbCall(() =>
+    db.collection<UserRow>("users").create({ ...params })
+  );
 }
 
 export interface UpdateTokensParams {
@@ -59,35 +57,33 @@ export interface UpdateTokensParams {
 }
 
 /**
- * Conditionally update tokens only if they are currently expired.
- * Returns the updated row if updated, null if another process already refreshed.
+ * Update tokens only if the stored token is currently expired.
+ * Returns the updated row, or null if another instance already refreshed.
  */
 export async function updateTokensIfExpired(
   params: UpdateTokensParams
 ): Promise<UserRow | null> {
+  const user = await getUserById(params.userId);
+  if (!user) return null;
+
+  // Only update if token is still expired (guards against concurrent double-refresh)
+  if (new Date(user.token_expires_at).getTime() >= Date.now()) return null;
+
   const db = getDbClient();
-  const now = new Date().toISOString();
-  const { data, error } = await db
-    .from('users')
-    .update({
+  return dbCall(() =>
+    db.collection<UserRow>('users').update(params.userId, {
       access_token: params.access_token,
       refresh_token: params.refresh_token,
       token_expires_at: params.token_expires_at,
-      updated_at: new Date().toISOString(),
     })
-    .eq('id', params.userId)
-    .lt('token_expires_at', now) // only update if still expired
-    .select()
-    .single();
-  if (error) {
-    if (error.code === 'PGRST116') return null; // 0 rows updated
-    throw new DatabaseError(error.message);
-  }
-  return data as UserRow;
+  );
 }
 
 export async function deleteUser(id: string): Promise<void> {
   const db = getDbClient();
-  const { error } = await db.from('users').delete().eq('id', id);
-  if (error) throw new DatabaseError(error.message);
+  try {
+    await dbCall(() => db.collection('users').delete(id));
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+  }
 }

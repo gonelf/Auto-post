@@ -1,23 +1,27 @@
 /**
- * Image storage abstraction using Tacobase/Supabase Storage.
- * Swap getStorageClient() to use a different provider.
+ * Image storage using Tacobase Storage.
+ *
+ * Tacobase stores files as fields on collection records.
+ * We use a dedicated 'media' collection with a 'file' field.
+ * The record ID serves as the deletion key.
+ *
+ * Required Tacobase setup:
+ *   Create a collection named 'media' with fields:
+ *     - file     (file type, max 20MB, accepts images)
+ *     - user_id  (text)
+ *
+ * File URL format: /api/db/files/:collectionName/:recordId/:filename
+ * Retrieved via: db.storage.getFileUrl(record, record.file)
  */
+import { getDbClient, dbCall } from '../db/client';
+import type { RecordModel } from '@tacobase/client';
 
-import { createClient } from '@supabase/supabase-js';
-
-function getStorageClient() {
-  const url = process.env.TACOBASE_URL!;
-  const key = process.env.TACOBASE_SERVICE_ROLE_KEY!;
-  return createClient(url, key).storage;
-}
-
-const BUCKET = process.env.STORAGE_BUCKET_NAME || 'post-images';
 const MAX_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
 const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 
 export interface UploadResult {
   url: string;
-  key: string;
+  key: string; // Tacobase media record ID — used for deletion
 }
 
 export class StorageError extends Error {
@@ -36,32 +40,36 @@ export function validateImageFile(file: File): void {
   }
 }
 
-export async function uploadImage(
-  file: File,
-  userId: string
-): Promise<UploadResult> {
-  const ext = file.type.split('/')[1] || 'jpg';
-  const key = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+// Tacobase RecordModel extended with our media fields
+type MediaRecord = RecordModel & {
+  file: string;   // filename string as stored by Tacobase
+  user_id: string;
+};
 
-  const storage = getStorageClient();
-  const arrayBuffer = await file.arrayBuffer();
-  const { error } = await storage.from(BUCKET).upload(key, arrayBuffer, {
-    contentType: file.type,
-    upsert: false,
-  });
+export async function uploadImage(file: File, userId: string): Promise<UploadResult> {
+  const db = getDbClient();
 
-  if (error) {
-    throw new StorageError(`Upload failed: ${error.message}`);
-  }
+  // Tacobase file uploads use FormData on the collection create call
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('user_id', userId);
 
-  const { data } = storage.from(BUCKET).getPublicUrl(key);
-  return { url: data.publicUrl, key };
+  const record = await dbCall(() =>
+    db.collection<MediaRecord>('media').create(formData)
+  );
+
+  // getFileUrl(record, filename) — 'filename' is the value stored in record.file
+  const url = db.storage.getFileUrl(record, record.file);
+
+  return { url, key: record.id };
 }
 
 export async function deleteImage(key: string): Promise<void> {
-  const storage = getStorageClient();
-  const { error } = await storage.from(BUCKET).remove([key]);
-  if (error) {
-    console.error(`Failed to delete image ${key}:`, error.message);
+  const db = getDbClient();
+  try {
+    await dbCall(() => db.collection('media').delete(key));
+  } catch (err) {
+    // Non-fatal: log but don't throw (post may already be submitted)
+    console.error(`Failed to delete media record ${key}:`, err);
   }
 }

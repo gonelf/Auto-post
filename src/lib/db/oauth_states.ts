@@ -1,4 +1,4 @@
-import { getDbClient, DatabaseError } from './client';
+import { getDbClient, dbCall, isNotFound } from './client';
 import type { OAuthStateRow } from './types';
 
 export async function createOAuthState(params: {
@@ -7,33 +7,51 @@ export async function createOAuthState(params: {
   expires_at: string;
 }): Promise<void> {
   const db = getDbClient();
-  const { error } = await db.from('oauth_states').insert(params);
-  if (error) throw new DatabaseError(error.message);
+  await dbCall(() => db.collection('oauth_states').create(params));
 }
 
 export async function consumeOAuthState(state: string): Promise<OAuthStateRow | null> {
   const db = getDbClient();
-  // Fetch the state
-  const { data, error } = await db
-    .from('oauth_states')
-    .select('*')
-    .eq('state', state)
-    .gt('expires_at', new Date().toISOString())
-    .single();
+  const now = new Date().toISOString();
 
-  if (error) {
-    if (error.code === 'PGRST116') return null;
-    throw new DatabaseError(error.message);
+  let record: OAuthStateRow;
+  try {
+    record = await dbCall(() =>
+      db
+        .collection<OAuthStateRow>('oauth_states')
+        .getFirstListItem(`state = "${state}" && expires_at > "${now}"`)
+    );
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
   }
 
-  // Delete it (one-time use)
-  await db.from('oauth_states').delete().eq('state', state);
+  // Delete it immediately — one-time use
+  try {
+    await dbCall(() => db.collection('oauth_states').delete(record.id));
+  } catch {
+    // Non-fatal: may already be consumed
+  }
 
-  return data as OAuthStateRow;
+  return record;
 }
 
-// Clean up expired states (call periodically)
+/** Clean up expired states (call periodically or from cron). */
 export async function pruneExpiredStates(): Promise<void> {
   const db = getDbClient();
-  await db.from('oauth_states').delete().lt('expires_at', new Date().toISOString());
+  const now = new Date().toISOString();
+
+  try {
+    const expired = await dbCall(() =>
+      db.collection<OAuthStateRow>('oauth_states').getFullList({
+        filter: `expires_at < "${now}"`,
+        fields: 'id',
+      })
+    );
+    for (const row of expired) {
+      await db.collection('oauth_states').delete(row.id).catch(() => {});
+    }
+  } catch {
+    // Non-fatal
+  }
 }

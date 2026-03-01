@@ -1,65 +1,51 @@
--- Reddit Auto-Post Database Schema
--- Run this in your Tacobase/Supabase SQL editor to set up the database.
+-- Reddit Auto-Post — Tacobase Collection Schema
+-- Run this in your Tacobase dashboard (SQL editor or collection builder).
+--
+-- Note: Tacobase auto-manages 'id', 'created', and 'updated' on every collection.
+-- Do NOT define these manually. Only define your custom fields below.
 
--- ── Users ────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS users (
-  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  reddit_user_id    text UNIQUE NOT NULL,   -- Reddit's t2_xxxxxxx account ID
-  reddit_username   text NOT NULL,
-  access_token      text NOT NULL,          -- AES-256-GCM encrypted
-  refresh_token     text NOT NULL,          -- AES-256-GCM encrypted
-  token_expires_at  timestamptz NOT NULL,
-  avatar_url        text,
-  created_at        timestamptz DEFAULT now(),
-  updated_at        timestamptz DEFAULT now()
-);
+-- ── users ─────────────────────────────────────────────────────────────────
+-- Custom fields (id/created/updated are automatic):
+--   reddit_user_id   text   UNIQUE  — Reddit's t2_xxxxxxx account ID
+--   reddit_username  text           — Display name (e.g. johndoe)
+--   access_token     text           — AES-256-GCM encrypted access token
+--   refresh_token    text           — AES-256-GCM encrypted refresh token
+--   token_expires_at text           — ISO-8601 UTC expiry
+--   avatar_url       text           — Reddit profile icon URL (nullable)
 
-CREATE INDEX IF NOT EXISTS idx_users_reddit_user_id ON users (reddit_user_id);
+-- ── posts ─────────────────────────────────────────────────────────────────
+-- Custom fields:
+--   user_id           text   — FK to users.id (set manually in app)
+--   post_type         text   — 'text' | 'link' | 'image'
+--   title             text   — max 300 chars
+--   subreddit         text   — without r/ prefix
+--   body_text         text   — nullable, text posts only
+--   link_url          text   — nullable, link posts only
+--   image_url         text   — nullable, image posts only (our storage URL)
+--   image_storage_key text   — nullable, media record ID for deletion
+--   status            text   — 'draft'|'scheduled'|'posting'|'posted'|'failed'
+--   scheduled_at      text   — ISO-8601 UTC (nullable = post immediately)
+--   posted_at         text   — nullable, actual submission timestamp
+--   reddit_post_id    text   — nullable, Reddit's t3_xxxxxx fullname
+--   reddit_post_url   text   — nullable, full permalink
+--   failure_reason    text   — nullable, last error message
+--   retry_count       number — default 0
 
--- ── Posts ────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS posts (
-  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id             uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  post_type           text NOT NULL CHECK (post_type IN ('text', 'link', 'image')),
-  title               text NOT NULL,
-  subreddit           text NOT NULL,
-  body_text           text,
-  link_url            text,
-  image_url           text,
-  image_storage_key   text,
-  status              text NOT NULL DEFAULT 'scheduled'
-                        CHECK (status IN ('draft', 'scheduled', 'posting', 'posted', 'failed')),
-  scheduled_at        timestamptz,
-  posted_at           timestamptz,
-  reddit_post_id      text,
-  reddit_post_url     text,
-  failure_reason      text,
-  retry_count         integer NOT NULL DEFAULT 0,
-  created_at          timestamptz DEFAULT now(),
-  updated_at          timestamptz DEFAULT now()
-);
+-- ── oauth_states ──────────────────────────────────────────────────────────
+-- Custom fields:
+--   state         text — random CSRF param (unique)
+--   code_verifier text — PKCE verifier
+--   expires_at    text — ISO-8601 UTC, 10 min TTL
 
--- Fast cron query: scheduled posts that are due
-CREATE INDEX IF NOT EXISTS idx_posts_status_scheduled_at
-  ON posts (status, scheduled_at)
-  WHERE status = 'scheduled';
+-- ── media ─────────────────────────────────────────────────────────────────
+-- Custom fields:
+--   file     file   — the uploaded image (file field type)
+--   user_id  text   — uploader's user ID
 
--- Dashboard query: user's posts sorted by created_at
-CREATE INDEX IF NOT EXISTS idx_posts_user_id_created_at
-  ON posts (user_id, created_at DESC);
-
--- ── OAuth States ─────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS oauth_states (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  state         text UNIQUE NOT NULL,
-  code_verifier text NOT NULL,
-  expires_at    timestamptz NOT NULL,
-  created_at    timestamptz DEFAULT now()
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_states_state ON oauth_states (state);
-
--- ── Storage bucket ────────────────────────────────────────────────────────────
--- Create a storage bucket named 'post-images' with public read access in the
--- Tacobase/Supabase dashboard, or run:
---   INSERT INTO storage.buckets (id, name, public) VALUES ('post-images', 'post-images', true);
+-- ─────────────────────────────────────────────────────────────────────────
+-- Tacobase uses 'updated' (auto-managed) for stale-post detection.
+-- The scheduler queries: updated < now()-5min for posts stuck in 'posting'.
+-- Ensure your Tacobase instance indexes on:
+--   posts: (status, scheduled_at) for the scheduler query
+--   posts: (user_id, created)     for the dashboard query
+--   oauth_states: (state)         for CSRF validation

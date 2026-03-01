@@ -1,4 +1,4 @@
-import { getDbClient, DatabaseError } from './client';
+import { getDbClient, dbCall, isNotFound } from './client';
 import type { PostRow, PostFilters } from './types';
 import type { PostCreatePayload } from '@/types/post';
 
@@ -8,37 +8,31 @@ export async function getPostsByUser(
 ): Promise<{ posts: PostRow[]; total: number }> {
   const db = getDbClient();
   const { page = 1, limit = 20, status } = filters;
-  const offset = (page - 1) * limit;
 
-  let query = db
-    .from('posts')
-    .select('*', { count: 'exact' })
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
+  let filter = `user_id = "${userId}"`;
+  if (status) filter += ` && status = "${status}"`;
 
-  if (status) {
-    query = query.eq('status', status);
-  }
+  const result = await dbCall(() =>
+    db.collection<PostRow>('posts').getList(page, limit, {
+      filter,
+      sort: '-created',
+    })
+  );
 
-  const { data, error, count } = await query;
-  if (error) throw new DatabaseError(error.message);
-  return { posts: (data as PostRow[]) || [], total: count || 0 };
+  return { posts: result.items, total: result.totalItems };
 }
 
 export async function getPostById(id: string, userId: string): Promise<PostRow | null> {
   const db = getDbClient();
-  const { data, error } = await db
-    .from('posts')
-    .select('*')
-    .eq('id', id)
-    .eq('user_id', userId)
-    .single();
-  if (error) {
-    if (error.code === 'PGRST116') return null;
-    throw new DatabaseError(error.message);
+  try {
+    const post = await dbCall(() => db.collection<PostRow>('posts').getOne(id));
+    // Enforce ownership
+    if (post.user_id !== userId) return null;
+    return post;
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
   }
-  return data as PostRow;
 }
 
 export async function createPost(
@@ -48,9 +42,8 @@ export async function createPost(
   const db = getDbClient();
   const scheduledAt = payload.scheduled_at || new Date().toISOString();
 
-  const { data, error } = await db
-    .from('posts')
-    .insert({
+  return dbCall(() =>
+    db.collection<PostRow>('posts').create({
       user_id: userId,
       post_type: payload.post_type,
       title: payload.title,
@@ -63,10 +56,7 @@ export async function createPost(
       scheduled_at: scheduledAt,
       retry_count: 0,
     })
-    .select()
-    .single();
-  if (error) throw new DatabaseError(error.message);
-  return data as PostRow;
+  );
 }
 
 export async function updatePost(
@@ -75,42 +65,42 @@ export async function updatePost(
   updates: Partial<PostRow>
 ): Promise<PostRow | null> {
   const db = getDbClient();
-  const { data, error } = await db
-    .from('posts')
-    .update({ ...updates, updated_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('user_id', userId)
-    .in('status', ['draft', 'scheduled'])
-    .select()
-    .single();
-  if (error) {
-    if (error.code === 'PGRST116') return null;
-    throw new DatabaseError(error.message);
-  }
-  return data as PostRow;
+
+  const existing = await getPostById(id, userId);
+  if (!existing) return null;
+  if (existing.status !== 'draft' && existing.status !== 'scheduled') return null;
+
+  return dbCall(() =>
+    db.collection<PostRow>('posts').update(id, updates as Record<string, unknown>)
+  );
 }
 
 export async function deletePost(id: string, userId: string): Promise<boolean> {
   const db = getDbClient();
-  const { error, count } = await db
-    .from('posts')
-    .delete({ count: 'exact' })
-    .eq('id', id)
-    .eq('user_id', userId);
-  if (error) throw new DatabaseError(error.message);
-  return (count || 0) > 0;
+
+  const existing = await getPostById(id, userId);
+  if (!existing) return false;
+
+  try {
+    await dbCall(() => db.collection('posts').delete(id));
+    return true;
+  } catch (err) {
+    if (isNotFound(err)) return false;
+    throw err;
+  }
 }
 
 export async function getPostStats(userId: string) {
   const db = getDbClient();
-  const { data, error } = await db
-    .from('posts')
-    .select('status')
-    .eq('user_id', userId);
-  if (error) throw new DatabaseError(error.message);
+  const posts = await dbCall(() =>
+    db.collection<PostRow>('posts').getFullList({
+      filter: `user_id = "${userId}"`,
+      fields: 'status',
+    })
+  );
 
   const stats = { total: 0, scheduled: 0, posted: 0, failed: 0 };
-  for (const row of (data as { status: string }[]) || []) {
+  for (const row of posts) {
     stats.total++;
     if (row.status === 'scheduled' || row.status === 'posting') stats.scheduled++;
     else if (row.status === 'posted') stats.posted++;
@@ -125,32 +115,42 @@ export async function getSchedulerDuePosts(limit = 50): Promise<PostRow[]> {
   const db = getDbClient();
   // Include a 30-second buffer to catch near-due posts
   const cutoff = new Date(Date.now() + 30_000).toISOString();
-  const { data, error } = await db
-    .from('posts')
-    .select('*')
-    .eq('status', 'scheduled')
-    .lte('scheduled_at', cutoff)
-    .lt('retry_count', 3)
-    .order('scheduled_at', { ascending: true })
-    .limit(limit);
-  if (error) throw new DatabaseError(error.message);
-  return (data as PostRow[]) || [];
+
+  const result = await dbCall(() =>
+    db.collection<PostRow>('posts').getList(1, limit, {
+      filter: `status = "scheduled" && scheduled_at <= "${cutoff}" && retry_count < 3`,
+      sort: 'scheduled_at',
+    })
+  );
+
+  return result.items;
 }
 
 /**
  * Optimistic lock: set status to 'posting' only if it's still 'scheduled'.
- * Returns true if we acquired the lock (0 rows updated means another instance grabbed it).
+ * Returns true if we acquired the lock.
+ *
+ * Note: Tacobase doesn't support conditional updates natively, so we
+ * check-then-update. Acceptable for low-concurrency cron scenarios.
  */
 export async function lockPostForProcessing(id: string): Promise<boolean> {
   const db = getDbClient();
-  const { data, error } = await db
-    .from('posts')
-    .update({ status: 'posting', updated_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('status', 'scheduled')
-    .select('id');
-  if (error) throw new DatabaseError(error.message);
-  return Array.isArray(data) && data.length > 0;
+
+  let post: PostRow;
+  try {
+    post = await dbCall(() => db.collection<PostRow>('posts').getOne(id));
+  } catch (err) {
+    if (isNotFound(err)) return false;
+    throw err;
+  }
+
+  if (post.status !== 'scheduled') return false;
+
+  await dbCall(() =>
+    db.collection<PostRow>('posts').update(id, { status: 'posting' })
+  );
+
+  return true;
 }
 
 export async function markPostPosted(
@@ -159,17 +159,14 @@ export async function markPostPosted(
   redditPostUrl: string
 ): Promise<void> {
   const db = getDbClient();
-  const { error } = await db
-    .from('posts')
-    .update({
+  await dbCall(() =>
+    db.collection('posts').update(id, {
       status: 'posted',
       reddit_post_id: redditPostId,
       reddit_post_url: redditPostUrl,
       posted_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
     })
-    .eq('id', id);
-  if (error) throw new DatabaseError(error.message);
+  );
 }
 
 export async function markPostFailed(
@@ -180,39 +177,52 @@ export async function markPostFailed(
 ): Promise<void> {
   const db = getDbClient();
   const isFinal = retryCount >= 3;
-  const { error } = await db
-    .from('posts')
-    .update({
-      status: isFinal ? 'failed' : 'scheduled',
-      retry_count: retryCount,
-      failure_reason: failureReason,
-      scheduled_at: isFinal ? undefined : rescheduleAt,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', id);
-  if (error) throw new DatabaseError(error.message);
+
+  const updateData: Record<string, unknown> = {
+    status: isFinal ? 'failed' : 'scheduled',
+    retry_count: retryCount,
+    failure_reason: failureReason,
+  };
+  if (!isFinal && rescheduleAt) {
+    updateData.scheduled_at = rescheduleAt;
+  }
+
+  await dbCall(() => db.collection('posts').update(id, updateData));
 }
 
 /**
  * Recover posts stuck in 'posting' status due to server crashes.
  * Resets them to 'scheduled' if they haven't been updated in 5 minutes.
+ * Uses Tacobase's auto-managed 'updated' timestamp for the stale check.
  */
 export async function recoverStalePostingPosts(): Promise<number> {
   const db = getDbClient();
   const staleCutoff = new Date(Date.now() - 5 * 60_000).toISOString();
-  const { data, error } = await db
-    .from('posts')
-    .update({
-      status: 'scheduled',
-      updated_at: new Date().toISOString(),
-    })
-    .eq('status', 'posting')
-    .lt('updated_at', staleCutoff)
-    .select('id');
-  if (error) {
-    // Non-fatal: log and continue
-    console.error('Failed to recover stale posting posts:', error.message);
+
+  let stalePosts: PostRow[];
+  try {
+    stalePosts = await dbCall(() =>
+      db.collection<PostRow>('posts').getFullList({
+        filter: `status = "posting" && updated < "${staleCutoff}"`,
+        fields: 'id',
+      })
+    );
+  } catch (err) {
+    console.error('Failed to query stale posting posts:', err);
     return 0;
   }
-  return Array.isArray(data) ? data.length : 0;
+
+  let recovered = 0;
+  for (const post of stalePosts) {
+    try {
+      await dbCall(() =>
+        db.collection('posts').update(post.id, { status: 'scheduled' })
+      );
+      recovered++;
+    } catch (err) {
+      console.error(`Failed to recover post ${post.id}:`, err);
+    }
+  }
+
+  return recovered;
 }

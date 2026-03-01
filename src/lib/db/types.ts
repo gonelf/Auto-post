@@ -1,13 +1,16 @@
+// Tacobase records use 'created' and 'updated' (managed automatically by the server).
+// Do NOT pass these in create() calls — they are set by Tacobase.
+
 export interface UserRow {
   id: string;
   reddit_user_id: string;
   reddit_username: string;
-  access_token: string; // AES-256-GCM encrypted
-  refresh_token: string; // AES-256-GCM encrypted
+  access_token: string;   // AES-256-GCM encrypted
+  refresh_token: string;  // AES-256-GCM encrypted
   token_expires_at: string; // ISO-8601 UTC
   avatar_url: string | null;
-  created_at: string;
-  updated_at: string;
+  created: string;  // managed by Tacobase
+  updated: string;  // managed by Tacobase
 }
 
 export interface PostRow {
@@ -27,8 +30,8 @@ export interface PostRow {
   reddit_post_url: string | null;
   failure_reason: string | null;
   retry_count: number;
-  created_at: string;
-  updated_at: string;
+  created: string;  // managed by Tacobase
+  updated: string;  // managed by Tacobase
 }
 
 export interface OAuthStateRow {
@@ -36,7 +39,8 @@ export interface OAuthStateRow {
   state: string;
   code_verifier: string;
   expires_at: string;
-  created_at: string;
+  created: string;  // managed by Tacobase
+  updated: string;  // managed by Tacobase
 }
 
 export interface PostFilters {
