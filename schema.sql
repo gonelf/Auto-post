@@ -1,0 +1,51 @@
+-- Reddit Auto-Post — Tacobase Collection Schema
+-- Run this in your Tacobase dashboard (SQL editor or collection builder).
+--
+-- Note: Tacobase auto-manages 'id', 'created', and 'updated' on every collection.
+-- Do NOT define these manually. Only define your custom fields below.
+
+-- ── users ─────────────────────────────────────────────────────────────────
+-- Custom fields (id/created/updated are automatic):
+--   reddit_user_id   text   UNIQUE  — Reddit's t2_xxxxxxx account ID
+--   reddit_username  text           — Display name (e.g. johndoe)
+--   access_token     text           — AES-256-GCM encrypted access token
+--   refresh_token    text           — AES-256-GCM encrypted refresh token
+--   token_expires_at text           — ISO-8601 UTC expiry
+--   avatar_url       text           — Reddit profile icon URL (nullable)
+
+-- ── posts ─────────────────────────────────────────────────────────────────
+-- Custom fields:
+--   user_id           text   — FK to users.id (set manually in app)
+--   post_type         text   — 'text' | 'link' | 'image'
+--   title             text   — max 300 chars
+--   subreddit         text   — without r/ prefix
+--   body_text         text   — nullable, text posts only
+--   link_url          text   — nullable, link posts only
+--   image_url         text   — nullable, image posts only (our storage URL)
+--   image_storage_key text   — nullable, media record ID for deletion
+--   status            text   — 'draft'|'scheduled'|'posting'|'posted'|'failed'
+--   scheduled_at      text   — ISO-8601 UTC (nullable = post immediately)
+--   posted_at         text   — nullable, actual submission timestamp
+--   reddit_post_id    text   — nullable, Reddit's t3_xxxxxx fullname
+--   reddit_post_url   text   — nullable, full permalink
+--   failure_reason    text   — nullable, last error message
+--   retry_count       number — default 0
+
+-- ── oauth_states ──────────────────────────────────────────────────────────
+-- Custom fields:
+--   state         text — random CSRF param (unique)
+--   code_verifier text — PKCE verifier
+--   expires_at    text — ISO-8601 UTC, 10 min TTL
+
+-- ── media ─────────────────────────────────────────────────────────────────
+-- Custom fields:
+--   file     file   — the uploaded image (file field type)
+--   user_id  text   — uploader's user ID
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Tacobase uses 'updated' (auto-managed) for stale-post detection.
+-- The scheduler queries: updated < now()-5min for posts stuck in 'posting'.
+-- Ensure your Tacobase instance indexes on:
+--   posts: (status, scheduled_at) for the scheduler query
+--   posts: (user_id, created)     for the dashboard query
+--   oauth_states: (state)         for CSRF validation
