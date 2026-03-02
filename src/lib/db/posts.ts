@@ -96,6 +96,7 @@ export async function getPostStats(userId: string) {
     db.collection<PostRow>('posts').getFullList({
       filter: `user_id = "${userId}"`,
       fields: 'status',
+      skipTotal: true,
     })
   );
 
@@ -113,13 +114,13 @@ export async function getPostStats(userId: string) {
 
 export async function getSchedulerDuePosts(limit = 50): Promise<PostRow[]> {
   const db = getDbClient();
-  // Include a 30-second buffer to catch near-due posts
-  const cutoff = new Date(Date.now() + 30_000).toISOString();
 
+  // @now + 30s catches posts due within the next 30 seconds (near-due buffer)
   const result = await dbCall(() =>
     db.collection<PostRow>('posts').getList(1, limit, {
-      filter: `status = "scheduled" && scheduled_at <= "${cutoff}" && retry_count < 3`,
+      filter: 'status = "scheduled" && scheduled_at <= @now + 30s && retry_count < 3',
       sort: 'scheduled_at',
+      skipTotal: true,
     })
   );
 
@@ -192,19 +193,19 @@ export async function markPostFailed(
 
 /**
  * Recover posts stuck in 'posting' status due to server crashes.
- * Resets them to 'scheduled' if they haven't been updated in 5 minutes.
- * Uses Tacobase's auto-managed 'updated' timestamp for the stale check.
+ * Resets them to 'scheduled' if Tacobase's auto-managed 'updated' timestamp
+ * is more than 5 minutes old — using the @now - 5m date macro.
  */
 export async function recoverStalePostingPosts(): Promise<number> {
   const db = getDbClient();
-  const staleCutoff = new Date(Date.now() - 5 * 60_000).toISOString();
 
   let stalePosts: PostRow[];
   try {
     stalePosts = await dbCall(() =>
       db.collection<PostRow>('posts').getFullList({
-        filter: `status = "posting" && updated < "${staleCutoff}"`,
+        filter: 'status = "posting" && updated < @now - 5m',
         fields: 'id',
+        skipTotal: true,
       })
     );
   } catch (err) {

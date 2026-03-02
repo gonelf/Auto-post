@@ -12,14 +12,14 @@ export async function createOAuthState(params: {
 
 export async function consumeOAuthState(state: string): Promise<OAuthStateRow | null> {
   const db = getDbClient();
-  const now = new Date().toISOString();
 
   let record: OAuthStateRow;
   try {
+    // @now macro avoids client/server clock skew issues
     record = await dbCall(() =>
       db
         .collection<OAuthStateRow>('oauth_states')
-        .getFirstListItem(`state = "${state}" && expires_at > "${now}"`)
+        .getFirstListItem(`state = "${state}" && expires_at > @now`)
     );
   } catch (err) {
     if (isNotFound(err)) return null;
@@ -39,13 +39,13 @@ export async function consumeOAuthState(state: string): Promise<OAuthStateRow | 
 /** Clean up expired states (call periodically or from cron). */
 export async function pruneExpiredStates(): Promise<void> {
   const db = getDbClient();
-  const now = new Date().toISOString();
 
   try {
     const expired = await dbCall(() =>
       db.collection<OAuthStateRow>('oauth_states').getFullList({
-        filter: `expires_at < "${now}"`,
+        filter: 'expires_at < @now',
         fields: 'id',
+        skipTotal: true,
       })
     );
     for (const row of expired) {
